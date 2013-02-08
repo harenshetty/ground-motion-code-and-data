@@ -1,0 +1,286 @@
+<html>
+<script type="text/javascript" src="https://c328740.ssl.cf1.rackcdn.com/mathjax/2.0-latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML">
+</script>
+
+<head>
+<title>Ground motion model building</title>
+</head>
+
+<body>
+
+<h1>Ground motion model building in <code>R</code></h1>
+<p>In seismology, there is a lot of effort put into building models that can predict the ground motion after an earthquake, measured as either peak ground acceleration (PGA), peak ground velocity (PGV), or spectral acceleration, given a set of covariates (features). The covariates typically consist of:</p>
+<ol>
+<li>earthquake magnitude;</li>
+<li>distance between monitoring site and earthquake epicenter;</li>
+<li>earthquake type;</li>
+<li>earthquake depth;</li>
+<li>site effects;</li>
+</ol>
+<p>where <i>site effects</i> are variables measured at the monitoring site, such as the soil type. In the industry, these models are called <b>ground motion prediction equations</b> (GMPE), and are usually fit as mixed-effects models.</p>
+
+<p>It is not my intention here to give a review on already existing GMPEs, but rather to demonstrate how to build a model, which includes a <i>spatial term</i>, in <code>R</code>. This is slightly different than what is currently done. Usually, any spatial autocorrelation in the residuals of GMPEs are ignored, but some preliminary research reveals that prospective evaluation of popular GMPEs results in significant spatial autocorrelation that is not accounted for by the model.</p>
+
+<p>Note that the model I am proposing here is entirely data driven and statistical. GMPEs almost always include physical justification for the functional form of the model. I will basically be trying to build the best predictive model that I can, but also one that makes some intuitive sense. I will attempt to compare the results that I get with those of a standard GMPE.</p>
+
+<h3>Before we begin</h3>
+<p>All of the code and the data that I use here are available on <a href="https://github.com/r-clements">github</a>.</p>
+
+<h3>Let's get started</h3>
+<p>First, let's load any packages that we will be using. Remember to install these using <code>install.packages("name of package")</code> before loading them.</p>
+
+<!--begin.rcode message=FALSE
+require(mgcv)
+require(ggplot2) #for some very nice plotting
+require(ggmap) #for including maps
+require(RColorBrewer)
+end.rcode-->
+
+<p>Now, let's read in our data and look at what we have:</p>
+
+<!--begin.rcode echo=FALSE
+setwd("~/work/GFZ/GMPE App")
+end.rcode-->
+
+<!--begin.rcode
+gmpe.data <- read.table("Data/all_data.dat", header = TRUE)
+head(gmpe.data)
+end.rcode-->
+
+<p>The columns are:</p>
+<ul>
+<li>PGA1: peak-ground acceleration in log scale (our response or <i>target</i> variable)</li>
+<li>stnm: station name</li>
+<li>stlon: longitude of station</li>
+<li>stlat: latitude of station</li>
+<li>Repi: distance between earthquake epicenter and station</li>
+<li>siteClass: type of soil at site (3-level factor)</li>
+<li>AVS30: average shear-wave velocity in upper 30 meters of soil</li>
+<li>event.num: ID for earthquake event</li>
+<li>mag: magnitude of earthquake</li>
+<li>eq.type: type of earthquake (3-level factor)</li>
+<li>depth: depth of earthquake </li>
+<li>resids: residuals from a commonly used GMPE in Japan</li>
+</ul>
+
+<p>We should begin with some exploratory analysis. I will just show some quick plots here, but much more can, and should, be done. </p>
+
+<!--begin.rcode fig.height=5, fig.width=6, fig.align="center"
+p <- ggplot(gmpe.data, aes(factor(mag), PGA1))
+p + geom_boxplot()
+
+p <- ggplot(gmpe.data, aes(factor(siteClass), PGA1))
+p + geom_boxplot()
+
+p <- ggplot(gmpe.data, aes(factor(eq.type), PGA1))
+p + geom_boxplot()
+
+p <- ggplot(gmpe.data, aes(Repi, PGA1, alpha = .1))
+p + geom_point() + theme(legend.position="none")
+end.rcode-->
+
+<p>There does not seem to be a very clear trend with magnitude, but it looks like there might be some effects in regards to the earthquake type and site condition, and a very obvious relationship with the epicentral distance.</p>
+
+<p>Like I said before, much more can be done before we dive in and start fitting the model. We could look at relationships in regards to each individual earthquake, earthquake type, or station. Perhaps the relationship with distance is different for each earthquake, which means we can estimate a <i>random slope</i> or <i>smooth term</i> for distance for each event.</p>
+
+<p>We should also get a sense of where our stations are located. Note that there are three stations on three small islands off of the coast of Tokyo. These stations are not used in any of the model fitting or testing.</p>
+
+<!--begin.rcode fig.height=5, fig.width=6, fig.align="center"
+stations <- unique(gmpe.data[,c("stnm", "stlon", "stlat", "siteClass")])
+#jp = get_map(location = "japan", zoom = 5, source = "osm", color = "bw")
+#open street map's server is often unavailable, so I'd suggest saving this map
+#save(jp, file = "jp")
+load("jp")
+locs <- ggmap(jp)
+locs <- locs + 
+  geom_point(data = stations, mapping = aes(x = stlon, y = stlat))
+locs
+end.rcode-->
+
+<h3>The model</h3>
+<p>There are many models we can choose from, such as a </p>
+<ul>
+<li>simple linear model;</li> 
+<li>non-linear models;</li> 
+<li>general additive models with smooth terms;</li> 
+<li>mixed-effects models;</li>
+<li>general additive mixed-effects models;</li>
+<li>and many more, including using Bayesian methodology or machine learning algorithms.</li>
+</ul>
+<p>
+For brevity, I will only show the results from a couple of models, a simple linear model and a model that includes a smooth spatial term. In practice, there are many hours, days, weeks, and even months that can go into finding the right model.</p>
+
+<h3>Cross validation</h3>
+<p>Since our data set is relatively limited, we can use cross-validation to estimate our expected prediction error, and for tuning any parameters. There are many references for cross-validation, so I won't get into details here. In this illustration, we will only use cross-validation for estimating prediction error, rather than for choosing parameters. There are many ways we can do cross-validation, but before we decide on our cross-validation scheme, we need to discuss one thing:</p>
+<h4>Boundary problems</h4>
+<p>As with any smooth spline, there are issues at the endpoints. Japan is a special case in that since it is a narrow island, many of the monitoring stations are on the boundary. Ideally, when fitting the model, each training set (the chunk of data we use to fit the model) will contain the stations on the boundary, to reduce boundary effects (meaning the variability that is unavoidable at the endpoints of a spline).</p>
+
+<p>Here are our boundary stations (I drew a rough polygon, and all stations outside that polygon are considered to be boundary stations):
+</p>
+
+<!--begin.rcode fig.height=5, fig.width=6, fig.align="center"
+load("bndry.stns")
+locs <- ggmap(jp)
+locs <- locs + 
+  geom_point(data = bndry.stns, mapping = aes(x = stlon, y = stlat))
+locs
+end.rcode-->
+
+<h4>Our cross-validation scheme</h4>
+<p>We wish to build a model that can predict the PGA at new locations, but also for new <i>future</i> earthquakes. Our cross-validation scheme should take this into consideration.</p>
+
+<p>There are several ways we can do this:</p>
+<ol>
+<li>Do cross-validation on the stations only.</li>
+<li>Do cross-validation on the earthquakes only.</li>
+<li>Do a combination of both.</li>
+</ol>
+<p>I don't really have an opinion on which is the best approach. We can try all three, but since we want to retain as much of the data as we can, we will do #1, and keep a set of earthquakes aside as a final testing set after all model fitting has been done.</p>
+
+<p>We start by dividing our 463 stations into groups. In one group are the boundary stations. We choose these a bit subjectively. These <i>boundary</i> stations will be included in <i>every</i> training set. Next, we divide the remaining stations, randomly, into 10 groups of approximately the same size.</p>
+
+<p>Since we also wish for our model to predict well for new earthquakes, we immediately set aside one group of earthquakes (the most recent five earthquakes) that will not be used in any model fitting. This will be our final <i>testing</i> group. We use the most recent earthquakes so that our testing is pseudo-prospective.</p>
+
+<!--begin.rcode
+load("cv.stations")
+
+#we have 332 non-boundary stations, so we will divide these up into 9 groups of 33 and 1 group of 35
+set.number <- c(rep(1:9, each = 33), rep(10, 35))
+
+#randomize the order of the stations
+set.seed(30102)
+cv.stations <- cv.stations[sample(1:nrow(cv.stations), size = nrow(cv.stations)), ]
+
+#randomize the order of the cv set numbers
+set.seed(1021)
+set.number <- set.number[sample(1:length(set.number), size = length(set.number))]
+cv.stations$set.number <- set.number
+
+#most recent 5 earthquakes will be the testing set, so let's remove these from our data right now
+testing.eqs <- tail(unique(gmpe.data$event.num),5)
+testing.data <- gmpe.data[gmpe.data$event.num %in% testing.eqs, ]
+training.data <- gmpe.data[!(gmpe.data$event.num %in% testing.eqs), ]
+
+#change to character for later
+training.data$stnm <- as.character(training.data$stnm)
+testing.data$stnm <- as.character(testing.data$stnm)
+cv.stations$stnm <- as.character(cv.stations$stnm)
+end.rcode-->
+
+<h3>Model fitting</h3>
+<p>Most GMPEs contain most or all of the covariates that are listed above, so let's start our model out that way and see if they are all useful. However, first we should define a function that will perform the cross-validation:</p>
+
+<!--begin.rcode
+cv.fun <- function(cv.data, formula) {
+  residuals <- c()
+  for(i in 1:10) {
+    test.stns <- cv.stations[cv.stations$set.number == i, "stnm"]
+    train <- cv.data[!(cv.data$stnm %in% test.stns), ]
+    test <- cv.data[cv.data$stnm %in% test.stns, ]
+    model.fit <- gam(formula, data = train)
+    predictions <- predict(model.fit, newdata = test)
+    residuals <- c(residuals, test$PGA1 - predictions)
+  }
+  return(residuals)
+}
+end.rcode-->
+
+<p>Note that this function only returns the residuals from the model, which we can use to summarize the error. We are keeping this super simple. We should, of course, be looking more closely at some model fitting diagnostics as well.</p>
+
+<p>After some experimentation, I've settled on the following models:
+<ul>
+<li>\[PGA \sim N(1 + \mathrm{Repi} + \mathrm{mag} + \mathrm{depth} + \mathrm{AVS30} + \mathrm{siteClass} + \mathrm{eq.type}, \sigma^{2})\]</li>
+<li>\[PGA \sim N(1 + \gamma_i + h(\mathrm{AVS30}) + \mathrm{siteClass} + \mathrm{eq.type}, \sigma^{2}),\]</li>
+</ul>
+<p>where \[\gamma_{i} = f_{i}(\mathrm{Repi}, \mathrm{mag}) + g_{i}(\mathrm{stlon}, \mathrm{stlat})\] for earthquake type \( i \), and \( f_{i} \), \( g_{i} \) and \( h \) are smooth functions. Basically, we will be fitting a different smooth (thin plate spline) to the locations of the stations for each type of earthquake. Also, to account for interaction between the magnitude of the earthquake and distance, we do a tensor product smooth for each type of earthquake. We use the tensor product smooth because magnitude and distance are on very different scales.</p>
+
+
+<!--begin.rcode
+#before we get too fancy, why don't we just fit a simple linear model, and then we can
+#compare this to the fancier models
+formula.lm = PGA1 ~ Repi + mag + depth + AVS30 + factor(siteClass) + factor(eq.type)
+
+#now we can get a bit more complicated 
+formula.gam = PGA1 ~ te(Repi, mag, by=eq.type, bs="tp", id=1) + s(stlon, stlat, by = eq.type, bs="tp", id=1) + s(AVS30, bs = "cr") + factor(siteClass) + factor(eq.type)
+end.rcode-->
+
+<p>Now, we fit the models using the <code>gam</code> function in the <code>mgcv</code>. First, we can just fit the model to all of the training data and take a look at the coefficients and smooth terms. After this, we can do some cross-validation and look at the error. To keep the model fitting speed down, for this illustration, I keep the smooth terms simple, and let <code>gam</code> choose the dimension of the basis. In practice, we would want to play around more with these smooths and these parameters. For instance, if our smooths are too wiggly, then we over-fit the data, and if they are too smooth, then we won't fit <i>any</i> data well. This is basically the <b>bias-variance tradeoff</b>.</p>
+
+<!--begin.rcode warning=FALSE, fig.height=10, fig.width=12, fig.align="center", error=FALSE, cache=TRUE
+model.fit.lm <- gam(formula.lm, data = training.data)
+model.fit.gam <- gam(formula.gam, data = training.data, method = "REML")
+
+#summary of the linear model
+summary(model.fit.lm)
+
+#diagnostic plots of the linear model
+gam.check(model.fit.lm)
+
+#summary of the gam model
+summary(model.fit.gam)
+
+#diagnostic plots of the gam model
+gam.check(model.fit.gam)
+end.rcode-->
+
+<h3>Model validation</h3>
+
+<p>We can see that the more complex model definitely fits the data better, but is it just over-fitting the data? We can look at both the cross-validation error and our testing set error to help answer this question.</p>
+
+<!--begin.rcode warning=FALSE, cache=TRUE
+#cross-validation error
+sqrt(mean(cv.fun(training.data, formula.lm)^2))
+sqrt(mean(cv.fun(training.data, formula.gam)^2))
+
+#testing error
+predict.lm <- predict(model.fit.lm, newdata = testing.data)
+predict.gam <- predict(model.fit.gam, newdata = testing.data)
+
+sqrt(mean((testing.data$PGA1 - predict.lm)^2))
+sqrt(mean((testing.data$PGA1 - predict.gam)^2))
+end.rcode-->
+
+<p>So, our cross-validation error for the smooth model is a little lower than the testing error, so it seems that there may be some slight over-fitting to these particular earthquakes in our training set. However, the score for the new earthquakes is still pretty good. To see how good, we can compare the testing error scores that we get from our fitted models to a more commonly used GMPE.</p>
+
+<!--begin.rcode 
+#in our testing data is already the residuals from a currently used GMPE for Japan
+sqrt(mean(testing.data$resids^2))
+end.rcode-->
+
+<p>Both of our models here have a lower error score than the current standard GMPE, though our linear model is hardly better. Our smooth model is about 20% better, and likely has eliminated any spatial autocorrelation left over in the residuals. This last statement can be checked using variograms or Moran's I or Geary's C tests (check out the <code>spdep</code> package). For now, we can just visually look at the residuals from the training data.</p>
+
+<!--begin.rcode fig.height=10, fig.width=12, fig.align="center"
+t1 <- rbind(training.data, training.data)
+t1$model <- rep(c("gam", "linear"), each = nrow(training.data))
+t1$residuals <- c(model.fit.gam$residuals, model.fit.lm$residuals)
+
+brewer.div <- colorRampPalette(brewer.pal(9, "RdBu"), interpolate = "spline")
+cols <- (brewer.div(256))
+cutoffs <- seq(-1.7,1.7, length.out=257)
+brks <- seq(-1.7,1.7,length.out=10)
+labs <- round(brks,2)
+
+p.spatial <- ggmap(jp)
+p.spatial <- p.spatial + 
+  geom_point(data = t1, mapping = aes(x = stlon, y = stlat, colour = residuals), size=4) +
+  scale_colour_gradientn(colours=cols, 
+                         name="Residual", values = cutoffs, limits = c(-1.7,1.7),
+                         labels=labs, breaks=brks, rescaler =
+                           function(x,...) x, oob=identity, guide="colourbar") +
+  xlab("Longitude") + ylab("Latitude") + 
+  labs(title = "Model residuals") +
+  theme(axis.text = element_text(size=14),
+        axis.title.y = element_text(size=16, vjust=.5), 
+        axis.title.x = element_text(size=16, vjust=.25)) +
+  facet_wrap(~model)
+p.spatial
+end.rcode-->
+
+<p>Nothing obvious seems to stand out from the <code>gam</code> model, though it is hard to be sure. The linear model has a more prominent trend, with positive and negative residuals on the east and west coasts, respectively.</p>
+
+<h3>Conclusion</h3>
+
+<p>Our purely statistical model with smooth terms performs better than the more widely used <i>physical</i> GMPE. Even our linear model is as good as the GMPE. Don't get me wrong, I am not saying that these models are better than a physical model, or that these models will always perform better on all future earthquakes. The GMPE we used here was fit to data that is not even included in our training set, and so it is possible that if we refit the GMPE using just our training data, then maybe its performance on our testing data will improve. However, there is no intuitive reason why this should be true, unless there have been some major improvements in the quality of data coming from the seismic stations in Japan in the past 5-10 years.</p>
+<p>In the future, I would like to experiment with the new "soap film" smooths that are included in the <code>mgcv</code> package. I am not sure how useful these types of smooths would be in Japan since it seems like it might be okay if the smooth term crosses the boundaries between Japan's islands, but it will be nice to find out.</p>
+</body>
+</html>
